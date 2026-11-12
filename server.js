@@ -22,7 +22,11 @@ if (isProd && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length 
   throw new Error('Set SESSION_SECRET to a random string of at least 32 characters in production.');
 }
 const sessionSecret = process.env.SESSION_SECRET || 'dev-only-change-this-secret-before-deploying-123456';
-const dataDir = path.join(__dirname, 'data');
+// Use a mounted persistent directory in production (e.g. Render Disk: /var/data).
+const dataDir = process.env.DATA_DIR || process.env.RENDER_DISK_PATH || path.join(__dirname, 'data');
+if (isProd && !process.env.DATA_DIR && !process.env.RENDER_DISK_PATH) {
+  throw new Error('Persistent storage is required in production. Mount a persistent disk and set DATA_DIR=/var/data before starting SSB.');
+}
 fs.mkdirSync(dataDir, { recursive: true });
 const db = new Database(path.join(dataDir, 'ssb.sqlite'));
 db.pragma('journal_mode = WAL');
@@ -132,14 +136,27 @@ db.exec(`CREATE TABLE IF NOT EXISTS saved_messages (user_id INTEGER NOT NULL REF
 ensureColumn('conversations','live_host_id','INTEGER');
 ensureColumn('conversations','avatar_url',"TEXT NOT NULL DEFAULT ''");
 ensureColumn('conversations','avatar_url',"TEXT NOT NULL DEFAULT ''");
-const uploadDir = path.join(__dirname, 'public', 'uploads');
+const uploadDir = path.join(dataDir, 'uploads');
 fs.mkdirSync(uploadDir, { recursive: true });
 const storage = multer.diskStorage({ destination: uploadDir, filename: (req,file,cb) => { const ext = path.extname(file.originalname).toLowerCase().slice(0,10); cb(null, crypto.randomBytes(18).toString('hex') + ext); } });
 const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 }, fileFilter: (req,file,cb) => { const mime=file.mimetype.split(';')[0].trim().toLowerCase(); const ext=path.extname(file.originalname).toLowerCase(); const allowedExt=new Set(['.png','.jpg','.jpeg','.gif','.webp','.mp3','.m4a','.aac','.ogg','.oga','.opus','.webm','.wav','.mp4','.mov','.pdf','.zip','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.csv','.txt']); const knownMime=/^(image\/(png|jpeg|gif|webp)|audio\/(mpeg|mp4|aac|ogg|oga|opus|webm|wav|x-wav|3gpp|x-m4a)|video\/(mp4|webm|ogg|quicktime)|application\/(pdf|zip|x-zip-compressed|msword|vnd\.ms-excel|vnd\.ms-powerpoint|vnd\.openxmlformats-officedocument\.(wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|octet-stream|vnd\.oasis\.opendocument\.text)|text\/(plain|csv))$/.test(mime); const ok=knownMime || (mime==='application/octet-stream' && allowedExt.has(ext)); cb(ok ? null : new Error('این نوع فایل پشتیبانی نمی‌شود؛ عکس، صوت، ویدئو، PDF، ZIP، Word، Excel، PowerPoint، CSV یا TXT انتخاب کن.'), ok); } });
 // Reliable admin bootstrap: use ADMIN_USERNAME as the configured admin phone/login.
 // If that account exists, promote it. If absent, create it. ADMIN_PASSWORD is required.
 // To reset an existing account's password once, set ADMIN_RESET_PASSWORD temporarily.
-function normalizePhone(value) { return String(value || '').replace(/[\\s().-]/g, ''); }
+function normalizeDigits(value) {
+  const digitMap = {'۰':'0','۱':'1','۲':'2','۳':'3','۴':'4','۵':'5','۶':'6','۷':'7','۸':'8','۹':'9','٠':'0','١':'1','٢':'2','٣':'3','٤':'4','٥':'5','٦':'6','٧':'7','٨':'8','٩':'9'};
+  return String(value || '').replace(/[۰-۹٠-٩]/g, ch => digitMap[ch] || ch);
+}
+function normalizePhone(value) {
+  let raw = normalizeDigits(value).trim().replace(/[\s().-]/g, '');
+  if (!raw) return '';
+  if (raw.startsWith('0098')) raw = '+98' + raw.slice(4);
+  else if (raw.startsWith('098')) raw = '+98' + raw.slice(3);
+  else if (raw.startsWith('0') && raw.length === 11) raw = '+98' + raw.slice(1);
+  else if (raw.startsWith('98') && raw.length === 12) raw = '+' + raw;
+  else if (/^\d{8,15}$/.test(raw)) raw = '+' + raw;
+  return raw;
+}
 const configuredAdminPhone = normalizePhone(process.env.ADMIN_USERNAME || process.env.ADMIN_PHONE || '');
 if (configuredAdminPhone) {
   const adminPassword = String(process.env.ADMIN_PASSWORD || '');
@@ -168,7 +185,7 @@ if (configuredAdminPhone) {
 }
 // Optional one-time reset for deployments where ADMIN_PASSWORD should not be synchronized.
 if (process.env.ADMIN_RESET_PASSWORD && configuredAdminPhone) {
-  const target = db.prepare('SELECT id FROM users WHERE phone=? OR username=?').get(configuredAdminPhone, configuredAdminPhone);
+  const target = db.prepare('SELECT id FROM users WHERE phone=? OR username=? COLLATE NOCASE').get(configuredAdminPhone, configuredAdminPhone);
   if (target && String(process.env.ADMIN_RESET_PASSWORD).length >= 12) {
     db.prepare("UPDATE users SET password_hash=?,role='admin' WHERE id=?")
       .run(bcrypt.hashSync(String(process.env.ADMIN_RESET_PASSWORD),12), target.id);
@@ -204,6 +221,7 @@ io.engine.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(uploadDir));
 
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false });
 const registerLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false });
@@ -231,37 +249,51 @@ const slugify = s => clean(s,40).toLowerCase().normalize('NFKD').replace(/[^a-z0
 
 app.get('/api/health', (req,res) => res.json({ ok: true, service: 'SSB Messenger' }));
 app.post('/api/register', registerLimiter, (req,res) => {
-  const phoneRaw = clean(req.body.phone || req.body.username, 32);
-  const phone = phoneRaw.replace(/[\s().-]/g, '');
-  const username = phone;
+  const phone = normalizePhone(clean(req.body.phone, 32));
+  const username = clean(req.body.username, 24).toLowerCase();
   const displayName = clean(req.body.displayName, 40);
   const password = String(req.body.password || '');
-  if (!/^\+?\d{8,15}$/.test(phone) || /^0+$/.test(phone)) return res.status(400).json({error:'شماره تلفن معتبر وارد کن.'});
+  if (!/^\+?\d{8,15}$/.test(phone) || /^\+?0+$/.test(phone)) return res.status(400).json({error:'شماره تلفن معتبر وارد کن.'});
+  if (!/^[a-z0-9_\.]{3,24}$/.test(username)) return res.status(400).json({error:'نام کاربری باید ۳ تا ۲۴ حرف انگلیسی، عدد یا _ و نقطه باشد.'});
   if (displayName.length < 2) return res.status(400).json({error:'نام نمایشی حداقل ۲ حرف باشد.'});
   if (password.length < 10 || password.length > 128) return res.status(400).json({error:'رمز عبور باید ۱۰ تا ۱۲۸ کاراکتر باشد.'});
   try {
+    const duplicatePhone = db.prepare('SELECT id,phone FROM users').all().some(u => normalizePhone(u.phone) === phone);
+    if (duplicatePhone) return res.status(409).json({error:'این شماره تلفن قبلاً برای یک حساب ثبت شده است.'});
     const hash = bcrypt.hashSync(password, 12);
     const info = db.prepare('INSERT INTO users(username,phone,display_name,password_hash) VALUES(?,?,?,?)').run(username, phone, displayName, hash);
     req.session.regenerate(err => {
       if (err) return res.status(500).json({error:'خطا در ساخت نشست.'});
       req.session.userId = Number(info.lastInsertRowid);
-      res.json({ok:true});
+      req.session.save(saveErr => {
+        if (saveErr) return res.status(500).json({error:'حساب ساخته شد، اما نشست ذخیره نشد. دوباره وارد شو.'});
+        res.json({ok:true});
+      });
     });
-  } catch(e) { res.status(409).json({error:'این شماره تلفن قبلاً برای یک حساب ثبت شده است.'}); }
+  } catch(e) {
+    const message = String(e.message || '').includes('users.username') ? 'این نام کاربری قبلاً انتخاب شده است.' : 'این شماره تلفن قبلاً برای یک حساب ثبت شده است.';
+    res.status(409).json({error:message});
+  }
 });
 app.post('/api/login', loginLimiter, (req,res) => {
-  const phoneRaw = clean(req.body.phone || req.body.username, 32);
-  const phone = phoneRaw.replace(/[\s().-]/g, '');
+  const loginRaw = clean(req.body.login || req.body.phone || req.body.username, 80);
+  const phone = normalizePhone(loginRaw);
+  const loginName = loginRaw.replace(/^@/, '').toLowerCase();
   const password = String(req.body.password || '');
-  const user = db.prepare('SELECT * FROM users WHERE phone=? OR username=?').get(phone, phone);
+  const compactLogin = normalizeDigits(loginRaw).replace(/[\s().-]/g, '');
+  const candidates = db.prepare('SELECT * FROM users WHERE username=? COLLATE NOCASE OR phone IN (?,?)').all(loginName, phone, compactLogin);
+  const user = candidates.find(u => u.username.toLowerCase() === loginName || (phone && normalizePhone(u.phone) === phone));
   if (!user || user.banned || !bcrypt.compareSync(password, user.password_hash)) {
-    return res.status(401).json({error:'نام کاربری یا رمز عبور نادرست است.'});
+    return res.status(401).json({error:'نام کاربری، شماره تلفن یا رمز عبور نادرست است.'});
   }
   req.session.regenerate(err => {
     if (err) return res.status(500).json({error:'خطا در ورود.'});
     req.session.userId = user.id;
-    logAction(user.id, 'login');
-    res.json({ok:true});
+    req.session.save(saveErr => {
+      if (saveErr) return res.status(500).json({error:'ذخیره نشست ورود ناموفق بود. دوباره تلاش کن.'});
+      logAction(user.id, 'login');
+      res.json({ok:true});
+    });
   });
 });
 app.post('/api/logout', (req,res) => req.session.destroy(() => { res.clearCookie('ssb.sid'); res.json({ok:true}); }));
@@ -271,24 +303,25 @@ app.get('/api/me', (req,res) => {
   res.json({user});
 });
 app.get('/api/users', requireAuth, (req,res) => {
-  const raw=clean(req.query.q,80);
-  if(raw.length<2) return res.json({users:[]});
-  const digitMap={'۰':'0','۱':'1','۲':'2','۳':'3','۴':'4','۵':'5','۶':'6','۷':'7','۸':'8','۹':'9',
-    '٠':'0','١':'1','٢':'2','٣':'3','٤':'4','٥':'5','٦':'6','٧':'7','٨':'8','٩':'9'};
-  const q=raw.replace(/[۰-۹٠-٩]/g,ch=>digitMap[ch]||ch);
-  const compact=q.replace(/[\\s().-]/g,'');
-  const variants=new Set([q,compact]);
-  if(/^09\\d{9}$/.test(compact)) variants.add('+98'+compact.slice(1));
-  if(/^9\\d{9}$/.test(compact)) { variants.add('0'+compact); variants.add('+98'+compact); }
-  if(/^\\+?98\\d{10}$/.test(compact)) variants.add('0'+compact.replace(/^\\+?98/,''));
-  const terms=[...variants].filter(x=>x.length>=2).map(x=>'%'+x+'%');
-  const phoneUsernameWhere=terms.map(()=>'(username LIKE ? OR phone LIKE ?)').join(' OR ');
-  const sql=`SELECT id,username,phone,display_name,bio,avatar_url,role FROM users
-    WHERE banned=0 AND id<>? AND (display_name LIKE ? OR ${phoneUsernameWhere})
-    ORDER BY CASE WHEN username=? OR phone=? THEN 0 ELSE 1 END,display_name LIMIT 50`;
-  const params=[req.user.id,'%'+q+'%',...terms.flatMap(t=>[t,t]),compact,compact];
+  const raw = clean(req.query.q, 80);
+  if (raw.length < 2) return res.json({users:[]});
+  const normalized = normalizeDigits(raw);
+  const compact = normalized.replace(/[\s().-]/g, '');
+  const variants = new Set([raw, normalized, compact, compact.toLowerCase()]);
+  const phone = normalizePhone(raw);
+  if (phone) variants.add(phone);
+  if (/^09\d{9}$/.test(compact)) variants.add('+98' + compact.slice(1));
+  if (/^9\d{9}$/.test(compact)) { variants.add('0' + compact); variants.add('+98' + compact); }
+  if (/^\+?98\d{10}$/.test(compact)) variants.add('0' + compact.replace(/^\+?98/, ''));
+  const terms = [...variants].filter(x => x.length >= 2).map(x => '%' + x + '%');
+  const searchWhere = terms.map(() => '(username LIKE ? COLLATE NOCASE OR phone LIKE ?)').join(' OR ');
+  const sql = `SELECT id,username,phone,display_name,bio,avatar_url,role FROM users
+    WHERE banned=0 AND id<>? AND (display_name LIKE ? COLLATE NOCASE OR ${searchWhere})
+    ORDER BY CASE WHEN username=? COLLATE NOCASE OR phone=? THEN 0 ELSE 1 END,display_name LIMIT 50`;
+  const params = [req.user.id, '%' + raw + '%', ...terms.flatMap(t => [t,t]), raw.toLowerCase(), phone || compact];
   res.json({users:db.prepare(sql).all(...params)});
-});// Recent chat previews used by the responsive conversation list.
+});
+// Recent chat previews used by the responsive conversation list.
 app.get('/api/chat-previews', requireAuth, (req,res) => {
   const uid = req.user.id;
   const direct = db.prepare(`SELECT u.id AS user_id,u.display_name,u.avatar_url,m.body,m.media_type,m.created_at,
@@ -711,7 +744,7 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req,res) => {
       posts: db.prepare('SELECT COUNT(*) n FROM channel_posts').get().n,
       conversations: db.prepare('SELECT COUNT(*) n FROM conversations').get().n
     },
-    users: db.prepare('SELECT id,username,display_name,role,banned,created_at FROM users ORDER BY id DESC LIMIT 200').all(),
+    users: db.prepare('SELECT id,username,display_name,role,banned,created_at FROM users ORDER BY id DESC').all(),
     logs: db.prepare(`SELECT a.id,a.action,a.details,a.created_at,u.username FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 50`).all()
   });
 });
